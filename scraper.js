@@ -9,9 +9,10 @@ const REQUEST_DELAY_MS = 0; // Delay between requests in milliseconds
 class MobileBGScraper {
     constructor() {
         this.baseUrl = 'https://www.mobile.bg';
-        this.startUrl = 'https://www.mobile.bg/obiavi/avtomobili-dzhipove/ot-2010/oblast-sofiya?price=8000&price1=12000';
+        this.startUrl = 'https://www.mobile.bg/obiavi/avtomobili-dzhipove/ot-2008/do-2015/namira-se-v-balgariya?price=7000&price1=15000&km=150000';
         this.firstOwnerKeywords = ['първи', 'първият', 'първия', 'история'];
         this.carLinks = [];
+        this.results = [];
         this.currentPage = 1;
         this.maxPages = MAX_PAGES_TO_SCRAPE;
         this.delay = REQUEST_DELAY_MS;
@@ -111,6 +112,7 @@ class MobileBGScraper {
         return {
             textContent: descriptionText,
             rawHtml: divContent.toLowerCase(),
+            fullHtml: divContent,
             querySelector: (selector) => {
                 if (selector === '.seller') {
                     return divContent.includes('class="seller"') ? {} : null;
@@ -189,6 +191,80 @@ class MobileBGScraper {
         return false;
     }
 
+    // Find which keyword matched in description, or null
+    findMatchingKeyword(textLower) {
+        for (const keyword of this.firstOwnerKeywords) {
+            if (textLower.includes(keyword)) return keyword;
+        }
+        return null;
+    }
+
+    // Parse car details from a listing container
+    parseCarDetails(carContainer, href) {
+        const html = carContainer.fullHtml || '';
+
+        // Title - look for anchor tag with class="title" inside zaglavie div
+        let title = '';
+        // Try anchor tag with class="title" first (most common)
+        const titleAnchorMatch = html.match(/<a[^>]+class="[^"]*title[^"]*"[^>]*>([\s\S]*?)<\/a>/i);
+        if (titleAnchorMatch) {
+            title = this.stripHtmlTags(titleAnchorMatch[1]);
+        } else {
+            // Fallback to div with class="title"
+            const titleDivMatch = html.match(/<div[^>]+class="[^"]*title[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
+            if (titleDivMatch) {
+                title = this.stripHtmlTags(titleDivMatch[1]);
+            }
+        }
+
+        // Price
+        let price = '';
+        const priceMatch = html.match(/<div[^>]+class="[^"]*price[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
+        if (priceMatch) {
+            const priceText = this.stripHtmlTags(priceMatch[1]);
+            // Extract BGN price (usually after лв. or just the number in лв)
+            const bgnMatch = priceText.match(/([\d\s.,]+)\s*лв\.?/i);
+            if (bgnMatch) {
+                price = bgnMatch[1].trim();
+            } else {
+                price = priceText.trim();
+            }
+        }
+
+        // Params block
+        let paramsHtml = '';
+        const paramsMatch = html.match(/<div[^>]+class="[^"]*params[^"]*"[^>]*>([\s\S]*?)<\/div>/i);
+        if (paramsMatch) paramsHtml = paramsMatch[1];
+
+        const paramsText = this.stripHtmlTags(paramsHtml).toLowerCase();
+
+        // Extract fields
+        const yearMatch = paramsText.match(/(\d{4})\s*г/);
+        const mileageMatch = paramsText.match(/([\d\s\.]+)\s*км/);
+        const fuelMatch = paramsText.match(/(дизелов|бензинов|газ)/);
+        const hpMatch = paramsText.match(/([\d\s\.]+)\s*к\.с\.?/);
+        const volumeMatch = paramsText.match(/([\d\s\.]+)\s*куб\.см/);
+        const transmissionMatch = paramsText.match(/(автоматична|ръчна)/);
+        const formFactorMatch = paramsText.match(/(седан|комби|купе|хечбек|джип)/);
+
+        const norm = (s) => (s || '').toString().replace(/\s+/g, ' ').trim();
+        const digits = (s) => (s || '').toString().replace(/[^0-9]/g, '');
+        const priceDigits = digits(price);
+
+        return {
+            link: href,
+            title: norm(title),
+            price: priceDigits,
+            year: digits(yearMatch?.[1] || '').slice(0, 4),
+            mileage: digits(mileageMatch?.[1] || ''),
+            fuel: norm(fuelMatch?.[1] || ''),
+            engineVolume: digits(volumeMatch?.[1] || ''),
+            horsepower: digits(hpMatch?.[1] || ''),
+            transmission: norm(transmissionMatch?.[1] || ''),
+            formFactor: norm(formFactorMatch?.[1] || ''),
+        };
+    }
+
     // Extract car links from a page
     extractCarLinks(document) {
         const carLinks = [];
@@ -221,10 +297,19 @@ class MobileBGScraper {
                         continue;
                     }
 
-                    // Check if it's a first-owner car
-                    if (this.isFirstOwner(carContainer)) {
+                    // Skip imports by description
+                    const desc = carContainer.textContent || '';
+                    if (desc.includes('нов внос')) {
+                        continue;
+                    }
+
+                    // Check if it's a first-owner car and capture matched keyword
+                    const matchedKeyword = this.findMatchingKeyword(desc);
+                    if (matchedKeyword) {
                         const fullUrl = href.startsWith('//') ? 'https:' + href : href;
                         carLinks.push(fullUrl);
+                        const details = this.parseCarDetails(carContainer, fullUrl);
+                        this.results.push({ ...details, matchedKeyword });
                         console.log(`Found first-owner car: ${fullUrl}`);
                     }
                 }
@@ -314,19 +399,38 @@ class MobileBGScraper {
         return hasNext;
     }
 
-    // Save results to file
+    // Save results to CSV file
     saveResults() {
-        // Remove duplicates
-        const uniqueCarLinks = [...new Set(this.carLinks)];
+        // Deduplicate by link
+        const seen = new Set();
+        const unique = [];
+        for (const r of this.results) {
+            if (seen.has(r.link)) continue;
+            seen.add(r.link);
+            unique.push(r);
+        }
 
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const filename = `first-owner-cars-${timestamp}.txt`;
+        const filename = `first-owner-cars-${timestamp}.csv`;
+        const esc = (s) => (s ?? '').toString().replace(/\|/g, ' ').trim();
+        const header = 'Линк|Заглавие|Цена|Година на производство|Пробег|Тип гориво|Обем на двигателя|Мощност|Скоростна кутия|Форм фактор|Намерен по ключова дума';
+        const rows = unique.map(r => [
+            esc(r.link),
+            esc(r.title),
+            esc(r.price),
+            esc(r.year),
+            esc(r.mileage),
+            esc(r.fuel),
+            esc(r.engineVolume),
+            esc(r.horsepower),
+            esc(r.transmission),
+            esc(r.formFactor),
+            esc(r.matchedKeyword)
+        ].join('|'));
 
-        const content = uniqueCarLinks.join('\n');
-        fs.writeFileSync(filename, content, 'utf8');
-
+        fs.writeFileSync(filename, [header, ...rows].join('\n'), 'utf8');
         console.log(`\nResults saved to ${filename}`);
-        console.log(`Total first-owner cars found: ${uniqueCarLinks.length} (${this.carLinks.length - uniqueCarLinks.length} duplicates removed)`);
+        console.log(`Total first-owner cars found: ${unique.length} (${this.results.length - unique.length} duplicates removed)`);
     }
 
     // Main scraping function
